@@ -67,6 +67,14 @@ uv run --env-file .env src/server.py
 curl http://127.0.0.1:9009/.well-known/agent-card.json
 ```
 
+The server runs in the foreground and must stay running: keep that terminal open and use a
+**second terminal** for `curl` and the tests. (Pressing Ctrl+C stops the server, after which the
+tests report "Could not connect to agent ... timed out".) To start it in its own window instead:
+
+```powershell
+Start-Process uv -ArgumentList "run --env-file .env src/server.py"
+```
+
 ## Run with Docker
 
 ```bash
@@ -80,7 +88,7 @@ The container binds `0.0.0.0:9009`; the card advertises `http://127.0.0.1:9009/`
 
 ```bash
 uv sync --extra test
-# start the agent (uv or docker, see above), then:
+# start the agent in another terminal (uv or docker, see above), then:
 uv run pytest -v --agent-url http://localhost:9009
 ```
 
@@ -125,6 +133,9 @@ repository secrets as environment variables, runs the tests, and pushes to GHCR.
    name `Playbot`, image `ghcr.io/acboudion/purple-agent-agentbeats-playbot-1:latest`,
    repository `https://github.com/acboudion/purple-agent-agentbeats-playbot-1`.
 3. Use **Copy agent ID** and keep the ID for leaderboard submissions.
+   Playbot is registered with agent ID `01a06e23-80e8-7db0-a268-b097393459a4`,
+   public page https://agentbeats.dev/acboudion/playbot-test
+   (manifest URL: `https://raw.githubusercontent.com/acboudion/purple-agent-agentbeats-playbot-1/refs/heads/main/amber-manifest.json5`).
 4. Submit to a leaderboard via Quick Submit (provide `OPENAI_API_KEY` in the form) or manually:
    fork the leaderboard repo, add the agent ID/image to its scenario, add `OPENAI_API_KEY` as a
    secret in the fork, push a non-main branch and follow the Actions summary.
