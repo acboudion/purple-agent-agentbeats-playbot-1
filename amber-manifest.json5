@@ -1,45 +1,67 @@
 {
+  // Amber manifest for the Playbot purple agent (agentbeats.dev).
+  // Stays on 0.1.0: the AgentBeats leaderboard scenarios and gateway target 0.1.0/v0.3,
+  // and nothing here needs >=0.2.0 syntax (object-form `when` guards).
   manifest_version: "0.1.0",
 
-  // TODO: Declare all config your agent needs from the deployer
-  // Use secret: true for sensitive values like API keys
+  // Config the deployer (a scenario) supplies. Property names must match
+  // ^[a-z][a-z0-9_]*$ and additionalProperties must be a boolean.
   config_schema: {
     type: "object",
     properties: {
-      my_api_key: { type: "string", secret: true },
+      // Required: the only key leaderboard scenarios reliably forward to participants.
+      openai_api_key: { type: "string", secret: true },
+
+      // Optional, only used when llm_provider = "gemini". `default: ""` keeps resolution
+      // working when a scenario does not pass it (Amber fills absent config from defaults).
+      google_api_key: { type: "string", secret: true, default: "" },
+
+      // Optional overrides. Empty string = agent built-in defaults ("openai" / "gpt-5.4-mini").
+      llm_provider: { type: "string", default: "" }, // "openai" | "gemini"
+      llm_model: { type: "string", default: "" },    // e.g. "gpt-5.4-mini", "gemini-3.8-flash"
     },
-    required: ["my_api_key"],
+    required: ["openai_api_key"],
     additionalProperties: false,
   },
 
-  // External services this agent uses
-  slots: {
-    proxy: { kind: "a2a", optional: true },
-  },
+  // No `slots`: Playbot never calls other agents. The template's optional `proxy` slot was
+  // removed (unused slots lint as manifest::unused_slot, and referencing an unbound optional
+  // slot is a hard error at manifest_version 0.1.0).
 
-  // Runtime configuration
   program: {
-    // TODO: Replace with your docker image
-    image: "ghcr.io/<your-username>/<your-repo-name>:latest",
-    entrypoint: "uv run python src/server.py --host 0.0.0.0 --port 9010",
+    // Built and pushed by .github/workflows/test-and-publish.yml on every push to main.
+    // The GHCR package must be public or the platform cannot pull it.
+    image: "ghcr.io/acboudion/purple-agent-agentbeats-playbot-1:latest",
 
-    // TODO: Pass config values as environment variables
+    // Replaces the image ENTRYPOINT and clears CMD, so this is the complete argv.
+    //   --no-sync   the venv was built at image build time; never re-resolve at runtime
+    //   --host      bind all interfaces (there is no host port mapping under Amber)
+    //   --port      must equal network.endpoints[].port below
+    //   --card-url  advertise loopback, not 0.0.0.0: Amber's router only rewrites card URLs
+    //               whose host is 127.0.0.1 / localhost / ::1
+    entrypoint: "uv run --no-sync src/server.py --host 0.0.0.0 --port 9009 --card-url http://127.0.0.1:9009/",
+
     env: {
-      MY_API_KEY: "${config.my_api_key}",
+      OPENAI_API_KEY: "${config.openai_api_key}",
+      GOOGLE_API_KEY: "${config.google_api_key}", // platform convention (not GEMINI_API_KEY)
+      LLM_PROVIDER: "${config.llm_provider}",
+      LLM_MODEL: "${config.llm_model}",
+      PYTHONUNBUFFERED: "1", // flush stdout so platform logs show progress live
     },
 
     network: {
       endpoints: [
-        { name: "a2a_endpoint", port: 9010 }, // ensure port matches your entrypoint
+        // Amber does not verify this matches the bound port; keep it equal to --port.
+        { name: "a2a_endpoint", port: 9009 },
       ],
     },
   },
 
-  // Capabilities provided by this agent
+  // The A2A capability this agent provides, bound to the endpoint above.
   provides: {
     a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
   },
 
-  // Capabilities exposed to the scenario
-  exports: { a2a: "a2a" },
+  // Expose it to the scenario as "a2a" (canonical dotted form, accepted at 0.1.0).
+  exports: { a2a: "provides.a2a" },
 }

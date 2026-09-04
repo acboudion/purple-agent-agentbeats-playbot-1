@@ -4,7 +4,8 @@ import httpx
 from uuid import uuid4
 
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
-from a2a.types import Message, Part, Role, TextPart
+from a2a.types import DataPart, Message, Part, Role, Task, TaskState, TextPart
+from a2a.utils.parts import get_text_parts
 
 
 # A2A validation helpers - adapted from https://github.com/a2aproject/a2a-inspector/blob/main/backend/validators.py
@@ -137,8 +138,17 @@ def validate_event(data: dict[str, Any]) -> list[str]:
 
 # A2A messaging helpers
 
-async def send_text_message(text: str, url: str, context_id: str | None = None, streaming: bool = False):
-    async with httpx.AsyncClient(timeout=10) as httpx_client:
+LLM_TIMEOUT = 180  # seconds; covers the agent's LLM timeout (120s) plus retries/backoff
+
+
+async def send_parts_message(
+    parts: list[Part],
+    url: str,
+    context_id: str | None = None,
+    streaming: bool = False,
+    timeout: float = LLM_TIMEOUT,
+):
+    async with httpx.AsyncClient(timeout=timeout) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=url)
         agent_card = await resolver.get_agent_card()
         config = ClientConfig(httpx_client=httpx_client, streaming=streaming)
@@ -148,7 +158,7 @@ async def send_text_message(text: str, url: str, context_id: str | None = None, 
         msg = Message(
             kind="message",
             role=Role.user,
-            parts=[Part(TextPart(text=text))],
+            parts=parts,
             message_id=uuid4().hex,
             context_id=context_id,
         )
@@ -156,6 +166,41 @@ async def send_text_message(text: str, url: str, context_id: str | None = None, 
         events = [event async for event in client.send_message(msg)]
 
     return events
+
+
+async def send_text_message(
+    text: str,
+    url: str,
+    context_id: str | None = None,
+    streaming: bool = False,
+    timeout: float = LLM_TIMEOUT,
+):
+    return await send_parts_message(
+        [Part(TextPart(text=text))], url, context_id=context_id, streaming=streaming, timeout=timeout
+    )
+
+
+def final_task(events) -> Task:
+    """Last Task snapshot in the event list (works for streaming and non-streaming)."""
+    tasks = [event[0] for event in events if isinstance(event, tuple)]
+    assert tasks, f"expected Task events, got: {events!r}"
+    return tasks[-1]
+
+
+def task_text(task: Task) -> str:
+    """Final status message text + all artifact text (what a green agent reads)."""
+    chunks: list[str] = []
+    if task.status.message:
+        chunks += get_text_parts(task.status.message.parts)
+    for artifact in task.artifacts or []:
+        chunks += get_text_parts(artifact.parts)
+    return "\n".join(chunks)
+
+
+def require_llm(task: Task) -> None:
+    """Skip (not fail) when the agent under test has no API key configured."""
+    if task.status.state == TaskState.failed and "LLM not configured" in task_text(task):
+        pytest.skip("agent has no LLM API key (OPENAI_API_KEY / GOOGLE_API_KEY)")
 
 
 # A2A conformance tests
@@ -197,3 +242,65 @@ async def test_message(agent, streaming):
     assert not all_errors, f"Message validation failed:\n" + "\n".join(all_errors)
 
 # Add your custom tests here
+
+def test_agent_card_is_filled_in(agent):
+    """The card must carry real, non-empty metadata (the template shipped empty strings)."""
+    card = httpx.get(f"{agent}/.well-known/agent-card.json").json()
+    assert card["name"] and card["description"] and card["version"]
+    assert "0.0.0.0" not in card["url"], "card must advertise a connectable (loopback) URL"
+    skill = card["skills"][0]
+    assert skill["id"] and skill["name"] and skill["description"] and skill["tags"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [True, False])
+async def test_llm_response(agent, streaming):
+    """A trivial instruction-following task completes with the answer in one artifact."""
+    events = await send_text_message(
+        "Reply with exactly the word PONG and nothing else.", agent, streaming=streaming
+    )
+    task = final_task(events)
+    require_llm(task)
+    assert task.status.state == TaskState.completed, task_text(task)
+    assert len(task.artifacts or []) == 1, "answer must be delivered as exactly one artifact"
+    assert task.status.message is None, "answer must not be duplicated in the final status"
+    assert "PONG" in task_text(task).upper()
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_memory(agent):
+    """Two messages in the same context_id share conversation history."""
+    first = final_task(await send_text_message("My favorite color is teal. Reply OK.", agent))
+    require_llm(first)
+    assert first.status.state == TaskState.completed, task_text(first)
+
+    second = final_task(await send_text_message(
+        "What is my favorite color? Answer with one word.", agent, context_id=first.context_id
+    ))
+    assert second.context_id == first.context_id
+    assert second.status.state == TaskState.completed, task_text(second)
+    assert "teal" in task_text(second).lower()
+
+
+@pytest.mark.asyncio
+async def test_json_data_part_input(agent):
+    """DataParts are merged into the prompt alongside TextParts."""
+    parts = [
+        Part(TextPart(text="Return the value field verbatim.")),
+        Part(DataPart(data={"task": "echo_field", "value": "pineapple"})),
+    ]
+    task = final_task(await send_parts_message(parts, agent))
+    require_llm(task)
+    assert task.status.state == TaskState.completed, task_text(task)
+    assert "pineapple" in task_text(task).lower()
+
+
+@pytest.mark.asyncio
+async def test_blank_message_fails_cleanly(agent):
+    """A whitespace-only message fails the task with a clear message and no LLM call.
+
+    (A completely empty TextPart is already rejected by the a2a SDK before the agent runs.)
+    """
+    task = final_task(await send_text_message("   ", agent))
+    assert task.status.state == TaskState.failed
+    assert "Empty message" in task_text(task)
