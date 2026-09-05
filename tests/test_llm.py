@@ -8,6 +8,10 @@ ENV_VARS = [
     "OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "GEMINI_BASE_URL",
     "LLM_PROVIDER", "LLM_MODEL", "LLM_TEMPERATURE", "LLM_REASONING_EFFORT",
     "LLM_MAX_OUTPUT_TOKENS", "LLM_TIMEOUT_S", "LLM_MAX_RETRIES",
+    # role-prefixed aliases that AgentBeats/Amber may use for the same secrets
+    "AGENT_OPENAI_API_KEY", "AMBER_CONFIG_OPENAI_API_KEY", "AMBER_CONFIG_AGENT_OPENAI_API_KEY",
+    "AGENT_GOOGLE_API_KEY", "AMBER_CONFIG_GOOGLE_API_KEY", "AMBER_CONFIG_AGENT_GOOGLE_API_KEY",
+    "AGENT_GEMINI_API_KEY", "AMBER_CONFIG_GEMINI_API_KEY", "AMBER_CONFIG_AGENT_GEMINI_API_KEY",
 ]
 
 
@@ -44,6 +48,14 @@ def test_gemini_api_key_alias(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "g-alias")
     cfg = resolve_config()
     assert cfg.provider == "gemini" and cfg.api_key == "g-alias"
+
+
+def test_role_prefixed_key_aliases(monkeypatch):
+    monkeypatch.setenv("AMBER_CONFIG_AGENT_OPENAI_API_KEY", "sk-prefixed")
+    cfg = resolve_config()
+    assert cfg.provider == "openai" and cfg.api_key == "sk-prefixed"
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-plain")
+    assert resolve_config().api_key == "sk-plain"  # the plain name wins over aliases
 
 
 def test_empty_strings_count_as_unset(monkeypatch):
@@ -83,3 +95,27 @@ def test_overrides(monkeypatch):
     assert cfg.reasoning_effort == "low"
     assert cfg.max_output_tokens == 512
     assert cfg.temperature == 0.2
+
+
+@pytest.mark.asyncio
+async def test_chat_reasoning_effort_none_uses_config_and_empty_string_omits(monkeypatch):
+    """None = configured default (LLM_REASONING_EFFORT); "" = send no reasoning_effort at all."""
+    from types import SimpleNamespace
+
+    from llm import LLMClient, LLMConfig
+
+    seen = []
+
+    async def create(**kwargs):
+        seen.append(kwargs)
+        message = SimpleNamespace(content="ok", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")], usage=None)
+
+    client = LLMClient(LLMConfig(provider="openai", model="m", api_key="k", base_url=None, reasoning_effort="medium"))
+    monkeypatch.setattr(client._client.chat.completions, "create", create)
+    await client.chat([{"role": "user", "content": "hi"}])
+    await client.chat([{"role": "user", "content": "hi"}], reasoning_effort="")
+    await client.chat([{"role": "user", "content": "hi"}], reasoning_effort="low", seed=7)
+    assert seen[0]["reasoning_effort"] == "medium"
+    assert "reasoning_effort" not in seen[1]
+    assert seen[2]["reasoning_effort"] == "low" and seen[2]["seed"] == 7 and "seed" not in seen[0]

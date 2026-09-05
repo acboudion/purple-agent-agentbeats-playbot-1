@@ -6,10 +6,11 @@ import logging
 import os
 
 from a2a.server.tasks import TaskUpdater
-from a2a.types import Message, Part, TaskState, TextPart
+from a2a.types import DataPart, Message, Part, TaskState, TextPart
 from a2a.utils import get_message_text, new_agent_text_message
 from a2a.utils.parts import get_data_parts, get_file_parts
 
+import pibench
 from llm import LLMNotConfiguredError, get_llm
 
 logger = logging.getLogger(__name__)
@@ -72,8 +73,9 @@ class Agent:
     async def _run(self, message: Message, updater: TaskUpdater) -> None:
         ctx = updater.context_id
 
-        user_content = build_user_content(message)
-        if not user_content:
+        payload = pibench.extract_payload(message)
+        user_content = "" if payload is not None else build_user_content(message)
+        if payload is None and not user_content:
             await updater.failed(
                 self._status_msg(updater, "Empty message: expected text or data parts")
             )
@@ -84,6 +86,17 @@ class Agent:
         except LLMNotConfiguredError as e:
             logger.error("[%s] %s", ctx, e)
             await updater.failed(self._status_msg(updater, str(e)))
+            return
+
+        # Pi-Bench path: the green owns the transcript, so no history and exactly one DataPart
+        # artifact (the green reads the first artifact's first part).
+        if payload is not None:
+            reply = await pibench.run_turn(payload, llm, context_id=ctx)
+            await updater.add_artifact(
+                parts=[Part(root=DataPart(data=reply))],
+                name=pibench.ARTIFACT_NAME,
+                metadata={"provider": llm.provider, "model": llm.model},
+            )
             return
 
         await updater.update_status(TaskState.working, self._status_msg(updater, "Thinking..."))

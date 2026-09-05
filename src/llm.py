@@ -42,9 +42,33 @@ class LLMNotConfiguredError(LLMError):
     """No usable provider / API key in the environment."""
 
 
+class OutputCapError(LLMError):
+    """The model hit max_completion_tokens before producing any text or tool call."""
+
+
 def _env(name: str, default: str = "") -> str:
     """Environment value with whitespace stripped; empty string means unset."""
     return os.environ.get(name, default).strip()
+
+
+# AgentBeats/Amber may deliver a secret under a role-prefixed name (the participant role on
+# Pi-Bench is "agent"). Deterministic lookup order, no scanning of the whole environment.
+_ALIAS_PREFIXES = ("", "AGENT_", "AMBER_CONFIG_", "AMBER_CONFIG_AGENT_")
+
+
+def _env_any(name: str) -> str:
+    for prefix in _ALIAS_PREFIXES:
+        value = _env(prefix + name)
+        if value:
+            return value
+    return ""
+
+
+def log_env_diagnostic() -> None:
+    """Log the NAMES of auth-relevant environment variables (never their values)."""
+    markers = ("OPENAI", "GOOGLE", "GEMINI", "API_KEY", "AMBER", "SECRET", "LLM_", "PIBENCH")
+    names = sorted(n for n in os.environ if any(m in n.upper() for m in markers))
+    logger.info("auth/config-relevant env var names: %s", names)
 
 
 @dataclass(frozen=True)
@@ -68,8 +92,8 @@ def resolve_config() -> LLMConfig:
 
     Raises LLMNotConfiguredError when no usable key is present.
     """
-    openai_key = _env("OPENAI_API_KEY")
-    gemini_key = _env("GOOGLE_API_KEY") or _env("GEMINI_API_KEY")
+    openai_key = _env_any("OPENAI_API_KEY")
+    gemini_key = _env_any("GOOGLE_API_KEY") or _env_any("GEMINI_API_KEY")
 
     provider = _env("LLM_PROVIDER").lower()
     provider = PROVIDER_ALIASES.get(provider, provider)
@@ -177,8 +201,15 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         reasoning_effort: str | None = None,
+        seed: int | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> ChatResult:
-        """One chat completion. Raises LLMError on failure or an empty answer."""
+        """One chat completion. Raises LLMError on failure or a capped/blocked empty answer.
+
+        `timeout` and `max_retries` override the client defaults for this call only (the HTTP
+        pool is shared); `seed` is forwarded only when given.
+        """
         cfg = self.config
         cap = max_tokens or cfg.max_output_tokens
         kwargs: dict[str, Any] = {
@@ -186,7 +217,8 @@ class LLMClient:
             "messages": messages,
             "max_completion_tokens": cap,
         }
-        effort = reasoning_effort or cfg.reasoning_effort
+        # None = use the configured default; "" = send no reasoning_effort at all.
+        effort = cfg.reasoning_effort if reasoning_effort is None else (reasoning_effort or None)
         if effort:
             kwargs["reasoning_effort"] = effort
         if cfg.temperature is not None:
@@ -198,8 +230,15 @@ class LLMClient:
             if tool_choice:
                 kwargs["tool_choice"] = tool_choice
 
+        if seed is not None:
+            kwargs["seed"] = seed
+        client = self._client
+        overrides = {k: v for k, v in {"timeout": timeout, "max_retries": max_retries}.items() if v is not None}
+        if overrides:
+            client = client.with_options(**overrides)
+
         try:
-            completion = await self._client.chat.completions.create(**kwargs)
+            completion = await client.chat.completions.create(**kwargs)
         except openai.APIStatusError as e:
             raise LLMError(
                 f"{self.describe()} request failed: HTTP {e.status_code}: {e.message}"
@@ -233,7 +272,7 @@ class LLMClient:
 
         if not text and not tool_calls:
             if choice.finish_reason == "length":
-                raise LLMError(
+                raise OutputCapError(
                     f"{self.describe()} hit the output cap ({cap} tokens, reasoning included) "
                     "before answering; raise LLM_MAX_OUTPUT_TOKENS or lower LLM_REASONING_EFFORT"
                 )

@@ -19,6 +19,7 @@
       // Optional overrides. Empty string = agent built-in defaults ("openai" / "gpt-5.4-mini").
       llm_provider: { type: "string", default: "" }, // "openai" | "gemini"
       llm_model: { type: "string", default: "" },    // e.g. "gpt-5.4-mini", "gemini-3.8-flash"
+      llm_reasoning_effort: { type: "string", default: "" }, // e.g. "low" | "medium" | "high"
     },
     required: ["openai_api_key"],
     additionalProperties: false,
@@ -46,6 +47,7 @@
       GOOGLE_API_KEY: "${config.google_api_key}", // platform convention (not GEMINI_API_KEY)
       LLM_PROVIDER: "${config.llm_provider}",
       LLM_MODEL: "${config.llm_model}",
+      LLM_REASONING_EFFORT: "${config.llm_reasoning_effort}",
       PYTHONUNBUFFERED: "1", // flush stdout so platform logs show progress live
     },
 
