@@ -7,11 +7,12 @@ import os
 import uvicorn
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentProvider, AgentSkill
+from starlette.middleware import Middleware
 
-from executor import Executor
-from llm import describe_llm
+from executor import BoundedTaskStore, Executor
+from llm import describe_llm, log_env_diagnostic
+from pibench import PiBenchCompatMiddleware
 
 AGENT_NAME = "Playbot"
 AGENT_VERSION = "0.1.0"  # keep in sync with [project].version in pyproject.toml
@@ -88,12 +89,26 @@ def build_agent_card(card_url: str) -> AgentCard:
     )
 
 
+def build_app(card_url: str, executor: Executor | None = None):
+    """The ASGI app: a2a-sdk routes wrapped in the Pi-Bench compatibility middleware."""
+    request_handler = DefaultRequestHandler(
+        agent_executor=executor or Executor(),
+        task_store=BoundedTaskStore(),
+    )
+    server = A2AStarletteApplication(
+        agent_card=build_agent_card(card_url),
+        http_handler=request_handler,
+    )
+    return server.build(middleware=[Middleware(PiBenchCompatMiddleware)])
+
+
 def main():
     # uvicorn configures only its own loggers; this makes agent/llm INFO lines visible.
     logging.basicConfig(
         level=(os.environ.get("LOG_LEVEL") or "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    log_env_diagnostic()
 
     parser = argparse.ArgumentParser(description=f"Run the {AGENT_NAME} A2A agent.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
@@ -107,21 +122,15 @@ def main():
     args = parser.parse_args()
 
     card_url = args.card_url or default_card_url(args.host, args.port)
-
-    request_handler = DefaultRequestHandler(
-        agent_executor=Executor(),
-        task_store=InMemoryTaskStore(),
-    )
-    server = A2AStarletteApplication(
-        agent_card=build_agent_card(card_url),
-        http_handler=request_handler,
-    )
+    app = build_app(card_url)
 
     logging.getLogger("server").info(
         "%s v%s listening on %s:%s; agent card advertises %s; LLM: %s",
         AGENT_NAME, AGENT_VERSION, args.host, args.port, card_url, describe_llm(),
     )
-    uvicorn.run(server.build(), host=args.host, port=args.port)
+    # Keep idle connections open: the Pi-Bench green reuses one HTTP client across a scenario
+    # with multi-second gaps between turns, and a server-side idle close is not retried.
+    uvicorn.run(app, host=args.host, port=args.port, timeout_keep_alive=300)
 
 
 if __name__ == "__main__":
