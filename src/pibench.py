@@ -644,8 +644,9 @@ def last_valid_decision(messages: list[dict[str, Any]]) -> tuple[str | None, int
             decision = canonical_decision(arguments.get("decision"))
             if decision is None:
                 continue
-            if _tool_result_failed(results.get(str(call.get("id")), "")):
-                continue
+            result = results.get(str(call.get("id")))
+            if result is None or _tool_result_failed(result):
+                continue  # never answered by the green, or answered with an error: not recorded
             found = (decision, index)
     return found
 
@@ -895,13 +896,16 @@ def merge_gated_reply(candidate: dict[str, Any], pre_gate: dict[str, Any],
                       gate_kind: str = "operational") -> dict[str, Any]:
     """Combine the answer to a gate re-ask with the reply that was held back.
 
-    The re-ask answered with a canonical record_decision -> that decision wins, but every
-    operational call from the held-back batch that the answer does not repeat is kept in front of
-    it (a re-ask can never drop work the model had already decided on). Only other tool calls ->
-    for the evidence gate send them alone (the decision belongs to a later turn, after their
-    results); for the operational gate prepend the held-back operational calls the answer lacks
-    and append the held-back record_decision last. Text only, or an invalid decision alone -> the
-    held-back reply wins.
+    The re-ask answered with a canonical record_decision -> that decision wins. If it is the
+    decision that was held back, every operational call from the held batch that the answer does
+    not repeat is kept (a re-ask can never drop work the model had already decided on); if the
+    decision changed, the old batch's operations belong to an outcome that no longer applies and
+    only the new batch goes out. Only other tool calls -> for the evidence gate send the lookups
+    alone (the decision belongs to a later turn, after their results); for the operational gate
+    add the held-back operational calls the answer lacks and append the held-back record_decision
+    last. Merged operational calls are ordered by the policy workflow (alerts, holds, cases,
+    actions, ticket logs, escalations) so a newly supplied prerequisite runs before the action
+    that depends on it. Text only, or an invalid decision alone -> the held-back reply wins.
     """
     calls = list(candidate.get("tool_calls") or [])
     others = [c for c in calls if c["function"]["name"] != DECISION_TOOL]
@@ -915,10 +919,33 @@ def merge_gated_reply(candidate: dict[str, Any], pre_gate: dict[str, Any],
         # the lookups go out alone; any decision waits for their results in a later turn
         return {**{k: v for k, v in candidate.items() if k != "tool_calls"}, "tool_calls": lookups}
     if valid:
-        return {**candidate, "tool_calls": kept + others + valid[-1:]}
+        new = canonical_decision(valid[-1]["function"]["arguments"].get("decision"))
+        old = canonical_decision(held_decision[0]["function"]["arguments"].get("decision")) if held_decision else None
+        if old is not None and new != old:
+            kept = []  # the held operations carried out a decision the model has now replaced
+        return {**candidate, "tool_calls": workflow_order(kept + others) + valid[-1:]}
     if others and held_decision:
-        return {**candidate, "tool_calls": kept + others + held_decision}
+        return {**candidate, "tool_calls": workflow_order(kept + others) + held_decision}
     return pre_gate
+
+
+# Policy workflow order for merged operational calls: alerts and flags, then holds, then cases,
+# then account unlocks, then the actions themselves (resets, refunds, grants, filings, ...), then
+# ticket logs (a ticket must exist before an escalation), then escalations. Unknown tools sort with
+# the actions; the sort is stable, so the model's own order survives within a step.
+_WORKFLOW_STEPS: tuple[tuple[str, ...], ...] = (
+    LOOKUP_PREFIXES, ("create_", "flag_"), ("hold_",), ("open_",), ("unlock_",), (), ("log_",), ("escalate_",),
+)
+
+
+def workflow_order(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def rank(call: dict[str, Any]) -> int:
+        name = call["function"]["name"].lower()
+        for step, prefixes in enumerate(_WORKFLOW_STEPS):
+            if prefixes and name.startswith(prefixes):
+                return step
+        return _WORKFLOW_STEPS.index(())
+    return sorted(calls, key=rank)
 
 
 def _same_action(a: dict[str, Any], b: dict[str, Any]) -> bool:
@@ -959,11 +986,7 @@ def missing_evidence(reply: dict[str, Any], tools: list[dict] | None,
         return []
     if has_valid_decision(history):
         return []
-    called = set()
-    for msg in history:
-        if msg.get("role") == "assistant":
-            for call in msg.get("tool_calls") or []:
-                called.add(str(_tool_function(call).get("name") or ""))
+    called = set(successful_calls(history))  # a lookup that errored gave the model no evidence
     return [tool_name(t) for t in tools or []
             if tool_name(t).lower().startswith(LOOKUP_PREFIXES) and tool_name(t) not in called]
 

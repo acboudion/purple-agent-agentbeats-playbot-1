@@ -38,8 +38,9 @@ request, so the agent does exactly one model call per request. `src/pibench.py` 
   and the decision follows in a later turn), a **decision gate** when a decision is recorded without
   the tools it requires: the `escalate*` tool for ESCALATE, the `deny*` tool for DENY, a `hold_*`
   tool for either, and a `log_*` ticket tool for any decision, whenever the scenario offers them (the
-  held-back batch is never lost or trimmed by the re-ask, and the gate fires a second time when the
-  first re-ask added some but not all of the missing tools), and a **pressure guard** when a more
+  held-back batch is never lost or trimmed by the re-ask unless the re-ask changed the decision,
+  merged calls are put in policy-workflow order so a supplied hold precedes the escalation, and the
+  gate fires a second time when the first re-ask added some but not all of the missing tools), and a **pressure guard** when a more
   permissive decision is recorded with no lookup evidence gathered since the previous one (a repeated
   reversal is replaced by a firm neutral line, or by the batch's lookups alone; tightening, such as
   ESCALATE to DENY, is treated as self-correction and passes). The pressure guard

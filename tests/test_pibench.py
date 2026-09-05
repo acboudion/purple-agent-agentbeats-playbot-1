@@ -677,6 +677,11 @@ def test_has_valid_decision_recognises_tool_errors_and_flat_calls():
     assert pibench.has_valid_decision(convo("ok", call=flat))
     bad = {"id": "d", "type": "function", "function": {"name": "record_decision", "arguments": '{"decision": "maybe"}'}}
     assert not pibench.has_valid_decision(convo("ok", call=bad))
+    # a decision the green never answered is not recorded (an incomplete transcript must not
+    # switch off the final-turn nudge or turn later decisions into "redundant" ones)
+    assert not pibench.has_valid_decision(convo("ok")[:-1])
+    assert pibench.last_valid_decision(convo("ok")[:-1]) == (None, -1)
+    assert pibench.needs_nudge(convo("ok")[:-1] + [{"role": "user", "content": "?"}] * 7)
 
 
 ESCALATE_TOOL = {"type": "function", "function": {
@@ -774,6 +779,10 @@ async def test_evidence_gate_lets_lookups_go_first():
     assert pibench.missing_evidence({"tool_calls": decision_batch()}, TOOLS + [query_tool], [GREETING]) == [
         "lookup_customer", "query_transaction_history"]
     assert pibench.missing_evidence({"tool_calls": decision_batch()}, TOOLS + [query_tool], DECIDED_DENY) == []
+    # a lookup that errored, or never came back, gave the model no evidence: the gate still fires
+    errored = LOOKED_UP[:-1] + [{"role": "tool", "tool_call_id": "l0", "content": "Error: no such customer"}]
+    assert pibench.missing_evidence({"tool_calls": decision_batch()}, TOOLS, errored) == ["lookup_customer"]
+    assert pibench.missing_evidence({"tool_calls": decision_batch()}, TOOLS, LOOKED_UP[:-1]) == ["lookup_customer"]
 
 
 def decision_batch(decision="DENY"):
@@ -1102,13 +1111,14 @@ def test_merge_gated_reply_never_drops_held_back_work():
     assert [c["id"] for c in merged["tool_calls"]] == ["a", "c", "e", "d2"]
     merged = pibench.merge_gated_reply({"tool_calls": [call("record_decision", "d2", decision="ESCALATE")]}, held, "evidence")
     assert [c["id"] for c in merged["tool_calls"]] == ["a", "c", "e", "d2"]
-    # the missing hold plus the decision -> everything, hold included, decision last
+    # the missing hold plus the decision -> everything, in workflow order (alert, hold, case,
+    # escalation), decision last
     hold = call("hold_transaction", "h")
     merged = pibench.merge_gated_reply({"tool_calls": [hold, call("record_decision", "d2", decision="ESCALATE")]}, held)
-    assert [c["id"] for c in merged["tool_calls"]] == ["a", "c", "e", "h", "d2"]
-    # the hold alone (operational gate) -> held-back calls, the hold, the held-back decision
+    assert [c["id"] for c in merged["tool_calls"]] == ["a", "h", "c", "e", "d2"]
+    # the hold alone (operational gate) -> the same batch with the held-back decision
     merged = pibench.merge_gated_reply({"tool_calls": [hold]}, held)
-    assert [c["id"] for c in merged["tool_calls"]] == ["a", "c", "e", "h", "d"]
+    assert [c["id"] for c in merged["tool_calls"]] == ["a", "h", "c", "e", "d"]
     # lookups alone (evidence gate) -> lookups only; the decision waits for their results
     look = call("lookup_customer", "l")
     assert pibench.merge_gated_reply({"content": "checking", "tool_calls": [look]}, held, "evidence") == {
@@ -1141,7 +1151,7 @@ def test_merge_gated_reply_never_drops_held_back_work():
         call("escalate_to_compliance", "e2", reason="Structuring pattern; hold placed", linked_case_id="C1"),
         call("log_ticket", "t2", summary="Wire request R1"),
         call("record_decision", "d2", decision="ESCALATE")]}, worded)
-    assert [c["id"] for c in merged["tool_calls"]] == ["h", "e2", "t2", "d2"]
+    assert [c["id"] for c in merged["tool_calls"]] == ["h", "t2", "e2", "d2"]  # ticket before escalation
     # a specific held call is not swallowed by a generic repeat
     assert pibench._same_action(call("hold_transaction", "h1", request_id="R1"), call("hold_transaction", "h3")) is False
     assert pibench._same_action(call("hold_transaction", "h1", request_id="R1"),
@@ -1153,6 +1163,23 @@ def test_merge_gated_reply_never_drops_held_back_work():
     merged = pibench.merge_gated_reply({"tool_calls": [call("create_alert", "a3", account_id="A", category="STRUCTURING"),
                                                        call("record_decision", "d2", decision="ESCALATE")]}, alerts)
     assert [c["id"] for c in merged["tool_calls"]] == ["a2", "a3", "d2"]
+    # a re-ask that changes the decision drops the held operations of the outcome it replaced
+    held_escalation = {"tool_calls": [call("escalate_to_compliance", "e1", reason="review"),
+                                      call("record_decision", "d", decision="ESCALATE")]}
+    merged = pibench.merge_gated_reply({"tool_calls": [call("deny_request", "n", request_id="R1"),
+                                                       call("record_decision", "d2", decision="DENY")]}, held_escalation)
+    assert [c["id"] for c in merged["tool_calls"]] == ["n", "d2"]
+    # a newly supplied prerequisite runs before the held action that depends on it
+    merged = pibench.merge_gated_reply({"tool_calls": [call("hold_transaction", "h", request_id="R1")]}, held_escalation)
+    assert [c["id"] for c in merged["tool_calls"]] == ["h", "e1", "d"]
+    merged = pibench.merge_gated_reply({"tool_calls": [call("hold_transaction", "h", request_id="R1"),
+                                                       call("record_decision", "d2", decision="ESCALATE")]}, held_escalation)
+    assert [c["id"] for c in merged["tool_calls"]] == ["h", "e1", "d2"]
+    ordered = pibench.workflow_order([
+        call("escalate_to_it_security", "e"), call("log_ticket", "t"), call("reset_password", "r"),
+        call("unlock_account", "u"), call("open_case", "c"), call("hold_transaction", "h"),
+        call("create_alert", "a"), call("deny_refund", "n"), call("lookup_customer", "l")])
+    assert [c["id"] for c in ordered] == ["l", "a", "h", "c", "u", "r", "n", "t", "e"]
     # an unchanged operational resend after the EVIDENCE gate keeps its decision (no lookups to defer for)
     resend = {"tool_calls": [escalate, call("record_decision", "d2", decision="ESCALATE")]}
     merged = pibench.merge_gated_reply(resend, {"tool_calls": [escalate, call("record_decision", "d", decision="ESCALATE")]}, "evidence")
