@@ -223,6 +223,39 @@ async def test_bootstrap_request_gets_non_ack_without_llm_call(fake, app_and_exe
 
 
 @pytest.mark.asyncio
+async def test_bootstrap_is_answered_even_without_an_llm_key(monkeypatch, app_and_executor):
+    from llm import LLMNotConfiguredError
+
+    def no_llm():
+        raise LLMNotConfiguredError("set OPENAI_API_KEY or GOOGLE_API_KEY")
+
+    monkeypatch.setattr(agent_mod, "get_llm", no_llm)
+    app, _ = app_and_executor
+    body = green_request([GREETING])
+    body["params"]["message"]["parts"][0]["data"] = {
+        "bootstrap": True, "benchmark_context": CONTEXT, "tools": TOOLS, "run_id": TASK_ID, "domain": ""}
+    response = (await post(app, body)).json()
+    assert "error" not in response
+    assert first_part(response)["data"] == {"content": pibench.BOOTSTRAP_TEXT}
+
+
+def test_extract_payload_requires_the_full_pi_bench_shape():
+    from a2a.types import DataPart, Message, Part, Role
+
+    def message(data):
+        return Message(role=Role.user, message_id="m", parts=[Part(root=DataPart(data=data))])
+
+    turn = {"messages": [GREETING], "benchmark_context": CONTEXT, "tools": TOOLS}
+    assert pibench.extract_payload(message(turn)) == turn
+    assert pibench.extract_payload(message({"messages": [GREETING], "context_id": "ctx-1"})) is not None
+    assert pibench.extract_payload(message({"bootstrap": True, "benchmark_context": CONTEXT})) is not None
+    # ordinary JSON input that merely has a `messages` list keeps the chat path
+    assert pibench.extract_payload(message({"task": "summarize", "messages": [GREETING]})) is None
+    assert pibench.extract_payload(message({"bootstrap": True})) is None
+    assert pibench.extract_payload(message({"messages": "not a list", "tools": TOOLS})) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["timeout", "error"])
 async def test_failures_become_fallback_text(monkeypatch, app_and_executor, kind):
     monkeypatch.setenv("PIBENCH_TURN_BUDGET_S", "0.2")
@@ -267,19 +300,66 @@ def test_format_reply_canonicalises_decision_and_orders_it_last():
     assert names == ["lookup_customer", "record_decision"]
     decision = reply["tool_calls"][-1]["function"]["arguments"]
     assert decision["decision"] == "ALLOW-CONDITIONAL"
-    assert decision["rationale"] == "Looking into it."
-    assert reply["content"] == "Looking into it."
+    assert decision["rationale"] == "Looking into it."  # the prose also backfills the rationale
+    assert reply["content"] == "Looking into it."  # kept here; `outgoing` strips it when sent
     assert pibench.canonical_decision(" ESCALATE ") == "ESCALATE"
     assert pibench.canonical_decision("maybe") is None
 
 
-def test_format_reply_strip_tool_content_knob(monkeypatch):
-    monkeypatch.setenv("PIBENCH_STRIP_TOOL_CONTENT", "1")
+@pytest.mark.asyncio
+async def test_prose_beside_tool_calls_is_stripped_on_the_way_out(monkeypatch):
     result = ChatResult(text="prose", finish_reason="tool_calls",
                         tool_calls=[ToolCall(id="l1", name="lookup_customer", arguments="{}")])
-    assert "content" not in pibench.format_reply(result)
+    shaped = pibench.format_reply(result)
+    assert shaped["content"] == "prose"  # kept for the guards to see
+    assert "content" not in pibench.outgoing(shaped)  # dropped when sent (default knob)
     text_only = ChatResult(text="prose", finish_reason="stop")
-    assert pibench.format_reply(text_only) == {"content": "prose"}
+    assert pibench.outgoing(pibench.format_reply(text_only)) == {"content": "prose"}  # text-only never stripped
+    reply = await pibench.run_turn(PAYLOAD, FakeLLM(results=[result]))
+    assert reply == {"tool_calls": shaped["tool_calls"]}
+    monkeypatch.setenv("PIBENCH_STRIP_TOOL_CONTENT", "0")
+    assert pibench.outgoing(shaped)["content"] == "prose"
+    reply = await pibench.run_turn(PAYLOAD, FakeLLM(results=[result]))
+    assert reply["content"] == "prose"
+
+
+@pytest.mark.asyncio
+async def test_invalid_decision_values_are_dropped_and_retried_with_a_note():
+    result = ChatResult(text="", finish_reason="tool_calls", tool_calls=[
+        ToolCall(id="l1", name="lookup_customer", arguments='{"customer_id": "C1"}'),
+        ToolCall(id="d1", name="record_decision", arguments='{"decision": "escalate to IT", "rationale": "x"}')])
+    assert [c["function"]["name"] for c in pibench.format_reply(result)["tool_calls"]] == ["lookup_customer"]
+    alone = ChatResult(text="", finish_reason="tool_calls", tool_calls=[
+        ToolCall(id="d1", name="record_decision", arguments='{"decision": "maybe"}')])
+    assert pibench.format_reply(alone) is None  # nothing usable -> the empty-output retry path
+    # prose beside a dropped decision never goes out on its own: it would announce an unrecorded outcome
+    announced = ChatResult(text="Your request has been escalated to IT Security.", finish_reason="tool_calls",
+                           tool_calls=[ToolCall(id="d1", name="record_decision", arguments='{"decision": "escalate to IT"}')])
+    assert pibench.format_reply(announced) is None
+    llm = FakeLLM(results=[announced, ChatResult(text="", finish_reason="tool_calls", tool_calls=[decision_call("ESCALATE")])])
+    reply = await pibench.run_turn({**PAYLOAD, "messages": LOOKED_UP}, llm)
+    assert [c["function"]["name"] for c in reply["tool_calls"]] == ["record_decision"] and len(llm.calls) == 2
+    assert llm.calls[-1][0][-1]["content"].startswith("# Invalid decision value")
+    # an invalid decision beside real tool calls: the batch is held and a valid decision requested once
+    escalate = ToolCall(id="e1", name="escalate_to_it_security", arguments='{"ticket_id": "T"}')
+    beside = ChatResult(text="", finish_reason="tool_calls", tool_calls=[
+        escalate, ToolCall(id="d1", name="record_decision", arguments='{"decision": "Escalate to IT Security"}')])
+    llm = FakeLLM(results=[beside, ChatResult(text="", finish_reason="tool_calls", tool_calls=[decision_call("ESCALATE")])])
+    reply = await pibench.run_turn({**PAYLOAD, "messages": LOOKED_UP, "tools": TOOLS + [ESCALATE_TOOL]}, llm)
+    assert [c["function"]["name"] for c in reply["tool_calls"]] == ["escalate_to_it_security", "record_decision"]
+    assert len(llm.calls) == 2 and llm.calls[-1][0][-1]["content"].startswith("# Invalid decision value")
+    # if the re-ask yields nothing, the shaped batch (without the bad decision) still goes out
+    llm = FakeLLM(results=[beside])
+    reply = await pibench.run_turn({**PAYLOAD, "messages": LOOKED_UP, "tools": TOOLS + [ESCALATE_TOOL]}, llm)
+    assert [c["function"]["name"] for c in reply["tool_calls"]] == ["escalate_to_it_security"]
+    # truncated arguments are not an invalid value: no note on the retry
+    cut = ChatResult(text="", finish_reason="length", tool_calls=[
+        ToolCall(id="d1", name="record_decision", arguments='{"decision": "DENY", "rationale": "Section 4.2 lock-up unt')])
+    llm = FakeLLM(results=[cut, ChatResult(text="", finish_reason="tool_calls", tool_calls=[decision_call("DENY")])])
+    reply = await pibench.run_turn({**PAYLOAD, "messages": LOOKED_UP}, llm)
+    assert [c["function"]["name"] for c in reply["tool_calls"]] == ["record_decision"]
+    assert not any(m["role"] == "system" and m["content"].startswith("# Invalid") for m in llm.calls[-1][0])
+    assert pibench.invalid_decision_value(cut) is False and pibench.invalid_decision_value(beside) is True
 
 
 @pytest.mark.asyncio
@@ -394,6 +474,26 @@ async def test_parameter_guard_downgrades_reasoning_effort_to_none_then_omits():
     assert reply == {"content": "fine"}
     assert strict.calls[0][1]["reasoning_effort"] == "none" and strict.calls[1][1]["reasoning_effort"] == ""
     assert pibench._param_overrides == {"reasoning_effort": ""}
+
+
+@pytest.mark.asyncio
+async def test_parameter_guard_handles_several_rejections_in_one_turn(monkeypatch):
+    """seed rejected, then reasoning_effort rejected twice: all handled within the same turn."""
+    monkeypatch.setenv("PIBENCH_SEND_SEED", "1")
+
+    def reject(kw):
+        if kw.get("seed") is not None:
+            return "HTTP 400: Unsupported parameter: 'seed'"
+        if kw.get("reasoning_effort"):
+            return EFFORT_400
+        return None
+
+    llm = RejectingLLM(reject)
+    reply = await pibench.run_turn({**PAYLOAD, "seed": 42}, llm)
+    assert reply == {"content": "fine"}
+    assert [(c[1].get("seed"), c[1].get("reasoning_effort")) for c in llm.calls] == [
+        (42, "medium"), (None, "medium"), (None, "none"), (None, "")]
+    assert pibench._param_overrides == {"seed": None, "reasoning_effort": ""}
 
 
 @pytest.mark.asyncio
@@ -695,11 +795,22 @@ def test_missing_operational_tool_requires_every_group():
     # ALLOW still needs the ticket log; nothing when no log_* tool is offered
     assert pibench.missing_operational_tool({"tool_calls": decision_batch("ALLOW")}, tools, LOOKED_UP) == ["log_ticket"]
     assert pibench.missing_operational_tool({"tool_calls": decision_batch("ALLOW")}, TOOLS + [hold], LOOKED_UP) == []
-    # calls earlier in the transcript or in the same batch satisfy a group
+    # successful calls earlier in the transcript, or calls in the same batch, satisfy a group
     history = LOOKED_UP + [{"role": "assistant", "tool_calls": [
-        {"id": "h0", "type": "function", "function": {"name": "hold_transaction", "arguments": '{"request_id": "REQ-1"}'}},
-        {"id": "l0", "type": "function", "function": {"name": "log_ticket", "arguments": '{"summary": "wire"}'}}]}]
+        {"id": "h9", "type": "function", "function": {"name": "hold_transaction", "arguments": '{"request_id": "REQ-1"}'}},
+        {"id": "t9", "type": "function", "function": {"name": "log_ticket", "arguments": '{"summary": "wire"}'}}]},
+        {"role": "tool", "tool_call_id": "h9", "content": '{"status": "held"}'},
+        {"role": "tool", "tool_call_id": "t9", "content": '{"ticket_id": "T1"}'}]
     assert pibench.missing_operational_tool({"tool_calls": batch}, tools, history) == ["escalate_to_it_security"]
+    # an earlier call whose result errored (or never came back) does not count as done
+    failed = history[:-2] + [{"role": "tool", "tool_call_id": "h9", "content": "Error: request not found"},
+                             {"role": "tool", "tool_call_id": "t9", "content": '{"ticket_id": "T1"}'}]
+    assert pibench.missing_operational_tool({"tool_calls": batch}, tools, failed) == [
+        "escalate_to_it_security", "hold_transaction"]
+    assert pibench.missing_operational_tool({"tool_calls": batch}, tools, history[:-2]) == [
+        "escalate_to_it_security", "hold_transaction", "log_ticket"]
+    assert pibench.successful_calls(history) == ["lookup_customer", "hold_transaction", "log_ticket"]
+    assert pibench.successful_calls(failed, 4) == ["log_ticket"]
     same_batch = [{"id": "e", "type": "function", "function": {"name": "escalate_to_it_security", "arguments": {}}}] + batch
     assert pibench.missing_operational_tool({"tool_calls": same_batch}, tools, history) == []
     # no decision in the batch -> nothing to check
@@ -805,6 +916,13 @@ def test_pressure_reversal_allows_new_evidence():
         {"role": "assistant", "tool_calls": [{"id": "l1", "type": "function", "function": {"name": "lookup_customer", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "l1", "content": "{}"}]
     assert pibench.pressure_reversal(flip, evidence_since) is None
+    # a lookup whose result errored, or never came back, is not evidence
+    failed_since = evidence_since[:-1] + [{"role": "tool", "tool_call_id": "l1", "content": "Error: no such customer"}]
+    assert pibench.pressure_reversal(flip, failed_since) == ("DENY", "ESCALATE")
+    assert pibench.pressure_reversal(flip, evidence_since[:-1]) == ("DENY", "ESCALATE")
+    # the same rule decides whether a same-value re-record is redundant
+    assert pibench.redundant_decision(same, evidence_since) is None
+    assert pibench.redundant_decision(same, failed_since) == "DENY"
     # an operational call after the decision (a ticket log, say) is not evidence either
     logged_since = DECIDED_DENY + [
         {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "log_ticket", "arguments": "{}"}}]},
@@ -824,8 +942,33 @@ def test_pressure_reversal_allows_new_evidence():
 
 
 @pytest.mark.asyncio
-async def test_redundant_re_record_is_stripped_and_reasked_for_text():
+async def test_redundant_re_record_is_stripped_and_reasked_for_text(monkeypatch):
     payload = {"messages": DECIDED_DENY, "benchmark_context": CONTEXT, "tools": TOOLS}
+    same = ChatResult(text="", finish_reason="tool_calls", tool_calls=[decision_call("DENY", call_id="d1")])
+    # a bare re-record whose re-ask returns nothing (or nothing valid) ends in FIRM_TEXT, never an empty part
+    for knob in ("1", "0"):
+        monkeypatch.setenv("PIBENCH_STRIP_TOOL_CONTENT", knob)
+        assert await pibench.run_turn(payload, FakeLLM(results=[same])) == {"content": pibench.FIRM_TEXT}
+        bad = ChatResult(text="", finish_reason="tool_calls",
+                         tool_calls=[ToolCall(id="x", name="record_decision", arguments='{"decision": "maybe"}')])
+        assert await pibench.run_turn(payload, FakeLLM(results=[same, bad, bad])) == {"content": pibench.FIRM_TEXT}
+    monkeypatch.delenv("PIBENCH_STRIP_TOOL_CONTENT", raising=False)
+    # a re-ask that raises ends the same way as one that returns nothing; no invalid-value note is added
+    raising = FakeLLM(results=[same])
+    original = raising.chat
+
+    async def chat(messages, **kwargs):
+        if raising.results:
+            return await original(messages, **kwargs)
+        raise LLMError("boom")
+
+    raising.chat = chat
+    assert await pibench.run_turn(payload, raising) == {"content": pibench.FIRM_TEXT}
+    bad = ChatResult(text="", finish_reason="tool_calls",
+                     tool_calls=[ToolCall(id="x", name="record_decision", arguments='{"decision": "maybe"}')])
+    llm = FakeLLM(results=[same, bad, bad])
+    await pibench.run_turn(payload, llm)
+    assert not any(m["role"] == "system" and m["content"].startswith("# Invalid") for m in llm.calls[-1][0])
     same = ChatResult(text="", finish_reason="tool_calls", tool_calls=[decision_call("DENY", call_id="d1")])
     # bare re-record -> re-ask once -> text answer is sent
     llm = FakeLLM(results=[same, ChatResult(text="The outcome stands under Section 4.2.", finish_reason="stop")])
@@ -849,6 +992,12 @@ async def test_redundant_re_record_is_stripped_and_reasked_for_text():
     assert pibench.redundant_decision({"tool_calls": decision_batch("ESCALATE")}, DECIDED_DENY) is None  # reversal path
     assert pibench.redundant_decision({"tool_calls": decision_batch("DENY")}, DECIDED_DENY) == "DENY"
     assert pibench.strip_decision({"content": "x", "tool_calls": decision_batch("DENY")}) == {"content": "x"}
+    # an operational call, or a lookup with no result yet, is not evidence: the re-record stays redundant
+    logged_since = DECIDED_DENY + [
+        {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "log_ticket", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "{}"}]
+    assert pibench.redundant_decision({"tool_calls": decision_batch("DENY")}, logged_since) == "DENY"
+    assert pibench.redundant_decision({"tool_calls": decision_batch("DENY")}, history[:-1]) == "DENY"
 
 
 def test_format_reply_backfills_rationale_only_when_schema_has_it():
@@ -964,12 +1113,86 @@ def test_merge_gated_reply_never_drops_held_back_work():
     look = call("lookup_customer", "l")
     assert pibench.merge_gated_reply({"content": "checking", "tool_calls": [look]}, held, "evidence") == {
         "content": "checking", "tool_calls": [look]}
+    # lookups plus a decision (evidence gate) -> the decision is deferred, never sent blind
+    merged = pibench.merge_gated_reply({"tool_calls": [look, call("record_decision", "d2", decision="DENY")]}, held, "evidence")
+    assert [c["id"] for c in merged["tool_calls"]] == ["l"]
+    # held-back calls are matched by identifier, so two holds on different records both survive
+    two_holds = {"tool_calls": [call("hold_transaction", "h1", request_id="R1"), call("hold_transaction", "h2", request_id="R2"),
+                                call("record_decision", "d", decision="ESCALATE")]}
+    merged = pibench.merge_gated_reply({"tool_calls": [call("hold_transaction", "h3", request_id="R1"), escalate,
+                                                       call("record_decision", "d2", decision="ESCALATE")]}, two_holds)
+    assert [c["id"] for c in merged["tool_calls"]] == ["h2", "h3", "e", "d2"]
     # an invalid decision value never replaces the valid held-back one
     bad = {"tool_calls": [escalate, call("record_decision", "x", decision="escalate to IT")]}
     merged = pibench.merge_gated_reply(bad, held)
     assert [c["id"] for c in merged["tool_calls"]] == ["a", "c", "e", "d"]
     assert pibench.merge_gated_reply({"tool_calls": [call("record_decision", "x", decision="maybe")]}, held) is held
     assert pibench.merge_gated_reply({"content": "I will escalate."}, held) is held
+    # without an argument in common the calls are distinct, so both held holds survive
+    for repeat in (call("hold_transaction", "h3"), call("hold_transaction", "h3", transaction_id="T9")):
+        merged = pibench.merge_gated_reply({"tool_calls": [repeat, call("record_decision", "d2", decision="ESCALATE")]}, two_holds)
+        assert [c["id"] for c in merged["tool_calls"]] == ["h1", "h2", "h3", "d2"]
+    # a held call with only free-text arguments is repeated by any reworded call of that tool
+    worded = {"tool_calls": [call("escalate_to_compliance", "e1", reason="Structuring pattern"),
+                             call("log_ticket", "t1", summary="Wire request"),
+                             call("record_decision", "d", decision="ESCALATE")]}
+    merged = pibench.merge_gated_reply({"tool_calls": [
+        call("hold_transaction", "h", request_id="R1"),
+        call("escalate_to_compliance", "e2", reason="Structuring pattern; hold placed", linked_case_id="C1"),
+        call("log_ticket", "t2", summary="Wire request R1"),
+        call("record_decision", "d2", decision="ESCALATE")]}, worded)
+    assert [c["id"] for c in merged["tool_calls"]] == ["h", "e2", "t2", "d2"]
+    # a specific held call is not swallowed by a generic repeat
+    assert pibench._same_action(call("hold_transaction", "h1", request_id="R1"), call("hold_transaction", "h3")) is False
+    assert pibench._same_action(call("hold_transaction", "h1", request_id="R1"),
+                                call("hold_transaction", "h3", request_id="R1", reason="x")) is True
+    # two alerts on the same account but different categories are distinct actions
+    alerts = {"tool_calls": [call("create_alert", "a1", account_id="A", category="STRUCTURING"),
+                             call("create_alert", "a2", account_id="A", category="MONEY_MOVEMENT"),
+                             call("record_decision", "d", decision="ESCALATE")]}
+    merged = pibench.merge_gated_reply({"tool_calls": [call("create_alert", "a3", account_id="A", category="STRUCTURING"),
+                                                       call("record_decision", "d2", decision="ESCALATE")]}, alerts)
+    assert [c["id"] for c in merged["tool_calls"]] == ["a2", "a3", "d2"]
+    # an unchanged operational resend after the EVIDENCE gate keeps its decision (no lookups to defer for)
+    resend = {"tool_calls": [escalate, call("record_decision", "d2", decision="ESCALATE")]}
+    merged = pibench.merge_gated_reply(resend, {"tool_calls": [escalate, call("record_decision", "d", decision="ESCALATE")]}, "evidence")
+    assert [c["id"] for c in merged["tool_calls"]] == ["e", "d2"]
+    # lookups plus operational calls (evidence gate) -> the lookups alone
+    merged = pibench.merge_gated_reply({"tool_calls": [look, escalate]}, held, "evidence")
+    assert [c["id"] for c in merged["tool_calls"]] == ["l"]
+
+
+@pytest.mark.asyncio
+async def test_evidence_gate_accepts_an_unchanged_operational_resend():
+    """The gate text says 'resend your previous batch unchanged'; doing so must keep the decision."""
+    escalate = ToolCall(id="e1", name="escalate_to_it_security", arguments='{"ticket_id": "T"}')
+    batch = ChatResult(text="", finish_reason="tool_calls", tool_calls=[escalate, decision_call("ESCALATE")])
+    llm = FakeLLM(results=[batch, batch])
+    reply = await pibench.run_turn({**PAYLOAD, "tools": TOOLS + [ESCALATE_TOOL]}, llm)
+    assert [c["function"]["name"] for c in reply["tool_calls"]] == ["escalate_to_it_security", "record_decision"]
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.parametrize("failed", [
+    "Error: no such customer", json.dumps("Error: no such customer"), '{"error": "not found"}',
+    '{"success": false, "message": "not found"}', '{"status": "error"}'])
+def test_every_error_result_form_denies_evidence_and_completion(failed):
+    lookup = {"role": "assistant", "tool_calls": [{"id": "l1", "type": "function", "function": {
+        "name": "lookup_customer", "arguments": "{}"}}]}
+    ok = DECIDED_DENY + [lookup, {"role": "tool", "tool_call_id": "l1", "content": '{"customer_id": "C1"}'}]
+    bad = DECIDED_DENY + [lookup, {"role": "tool", "tool_call_id": "l1", "content": failed}]
+    flip = {"tool_calls": decision_batch("ESCALATE")}
+    assert pibench.pressure_reversal(flip, ok) is None
+    assert pibench.pressure_reversal(flip, bad) == ("DENY", "ESCALATE")
+    assert pibench.redundant_decision({"tool_calls": decision_batch("DENY")}, ok) is None
+    assert pibench.redundant_decision({"tool_calls": decision_batch("DENY")}, bad) == "DENY"
+    assert pibench.successful_calls(ok, 3) == ["lookup_customer"] and pibench.successful_calls(bad, 3) == []
+    assert pibench.successful_calls(bad[:-1], 3) == []  # no result at all
+
+
+def test_firm_text_and_prompt_do_not_invent_channels():
+    assert "channel" not in pibench.FIRM_TEXT and "formal review" not in pibench.FIRM_TEXT
+    assert "without inventing channels" in pibench.build_system_prompt(CONTEXT, TOOLS)
 
 
 @pytest.mark.asyncio

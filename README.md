@@ -43,7 +43,11 @@ request, so the agent does exactly one model call per request. `src/pibench.py` 
   permissive decision is recorded with no lookup evidence gathered since the previous one (a repeated
   reversal is replaced by a firm neutral line, or by the batch's lookups alone; tightening, such as
   ESCALATE to DENY, is treated as self-correction and passes). The pressure guard
-  runs before the gates so a gate can never coach the model into carrying out a reversed decision. A same-value re-record with no new evidence is stripped instead
+  runs before the gates so a gate can never coach the model into carrying out a reversed decision.
+  Earlier tool calls count as done, or as evidence, only when their result came back without an
+  error; a `record_decision` with a value outside the four allowed ones is dropped and the model is
+  asked once for a valid one; prose that accompanies tool calls is kept for the guards to read and
+  dropped on the way out (see `PIBENCH_STRIP_TOOL_CONTENT`). A same-value re-record with no new evidence is stripped instead
   (the model is asked once for a text answer), which keeps late turns from burning the green's step
   budget on redundant `record_decision` calls. Identifier parameters of `record_decision` that the model leaves
   out are copied from the transcript's own tool calls and results. The gate rules come from the
@@ -58,7 +62,7 @@ request, so the agent does exactly one model call per request. `src/pibench.py` 
 | `PIBENCH_LLM_TIMEOUT_S` / `PIBENCH_LLM_MAX_RETRIES` | `80` / `2` | Per-attempt timeout and SDK retries for this path. |
 | `PIBENCH_MAX_OUTPUT_TOKENS` | `24000` | Output cap including reasoning tokens. |
 | `PIBENCH_SEND_SEED` | `0` | Forward the green's `seed` (OpenAI only). A rejected parameter is retried without it. |
-| `PIBENCH_STRIP_TOOL_CONTENT` | `0` | Drop prose that accompanies tool calls. |
+| `PIBENCH_STRIP_TOOL_CONTENT` | `1` | Drop prose that accompanies tool calls (the judges read every assistant text, and text sent with tool calls can announce an outcome before `record_decision` succeeded). |
 | `PIBENCH_NUDGE_AFTER_USER_TURNS` / `PIBENCH_MAX_STEPS` / `PIBENCH_NUDGE_STEP_MARGIN` | `7` / `40` / `4` | When the decision reminder fires. |
 
 Local end-to-end check with the real green agent (costs cents; the user simulator uses

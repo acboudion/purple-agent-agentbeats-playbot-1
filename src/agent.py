@@ -81,6 +81,16 @@ class Agent:
             )
             return
 
+        # A bootstrap probe needs no model: answer it before resolving the LLM so a missing or
+        # oddly named key still yields the harmless non-ack the green expects.
+        if payload is not None and payload.get("bootstrap"):
+            reply = await pibench.run_turn(payload, None, context_id=ctx)
+            await updater.add_artifact(
+                parts=[Part(root=DataPart(data=reply))], name=pibench.ARTIFACT_NAME,
+                metadata={"bootstrap": True},
+            )
+            return
+
         try:
             llm = get_llm()
         except LLMNotConfiguredError as e:
