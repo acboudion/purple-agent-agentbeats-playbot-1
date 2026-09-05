@@ -1134,20 +1134,26 @@ async def run_turn(data: dict[str, Any], llm, *, context_id: str = "") -> dict[s
                 if not usable:
                     reply = {"content": FIRM_TEXT}
                 break
+            if reversal_gated:
+                # After a refused reversal only text or lookups may leave this turn, whatever the
+                # re-ask contains: an operational call without record_decision would still carry
+                # the reversed decision out, and prose beside it would announce that.
+                calls = reply.get("tool_calls") or []
+                if any(not c["function"]["name"].lower().startswith(LOOKUP_PREFIXES) for c in calls):
+                    logger.warning("[%s] decision guard: dropping tool calls sent after a refused reversal (%s)",
+                                   context_id, [c["function"]["name"] for c in calls])
+                    reply = lookups_only(reply) or {"content": FIRM_TEXT}
+                break
             # The pressure guard runs before the gates so that a gate never coaches the model into
             # carrying out a reversed decision.
             reversal = pressure_reversal(reply, history)
-            if reversal and not reversal_gated:
+            if reversal:
                 reversal_gated = True
                 reply = None  # the refused batch must never be sent, whatever the re-ask returns
                 logger.info("[%s] decision guard: %s -> %s without new evidence; re-asking once",
                             context_id, *reversal)
                 messages.append({"role": "system", "content": REVERSAL_TEXT.format(prev=reversal[0])})
                 continue
-            if reversal:  # the model insisted: only its lookups go out, or a firm neutral line
-                logger.warning("[%s] decision guard: dropping repeated reversal %s -> %s", context_id, *reversal)
-                reply = lookups_only(reply) or {"content": FIRM_TEXT}
-                break
             if "evidence" not in gates and not nudged:  # the nudged (final) turn must carry the decision
                 lookups = missing_evidence(reply, tools, history)
                 if lookups:

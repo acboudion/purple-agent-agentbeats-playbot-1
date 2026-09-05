@@ -1047,6 +1047,25 @@ async def test_reversal_is_never_laundered_through_the_operational_gate():
     ])
     reply = await pibench.run_turn(payload, llm)
     assert [c["function"]["name"] for c in reply["tool_calls"]] == ["lookup_customer"] and "content" not in reply
+    # a re-ask that answers with the operational call alone (no record_decision) is refused too
+    flip = ChatResult(text="", finish_reason="tool_calls", tool_calls=[decision_call("ESCALATE", call_id="d1")])
+    cases = [
+        (ChatResult(text="", finish_reason="tool_calls", tool_calls=[escalate]), {"content": pibench.FIRM_TEXT}),
+        (ChatResult(text="I have escalated this.", finish_reason="tool_calls", tool_calls=[escalate]),
+         {"content": pibench.FIRM_TEXT}),
+        (ChatResult(text="", finish_reason="tool_calls", tool_calls=[lookup, escalate]),
+         {"tool_calls": [{"id": "l1", "type": "function", "function": {"name": "lookup_customer",
+                                                                       "arguments": {"customer_id": "C1"}}}]}),
+        (ChatResult(text="", finish_reason="tool_calls", tool_calls=[lookup]),
+         {"tool_calls": [{"id": "l1", "type": "function", "function": {"name": "lookup_customer",
+                                                                       "arguments": {"customer_id": "C1"}}}]}),
+        (ChatResult(text="The denial stands under Section 4.2.", finish_reason="stop"),
+         {"content": "The denial stands under Section 4.2."}),
+    ]
+    for answer, expected in cases:
+        llm = FakeLLM(results=[flip, answer])
+        assert await pibench.run_turn(payload, llm) == expected, answer
+        assert len(llm.calls) == 2
 
 
 @pytest.mark.asyncio

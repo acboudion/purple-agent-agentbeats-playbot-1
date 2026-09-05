@@ -42,8 +42,9 @@ request, so the agent does exactly one model call per request. `src/pibench.py` 
   merged calls are put in policy-workflow order so a supplied hold precedes the escalation, and the
   gate fires a second time when the first re-ask added some but not all of the missing tools), and a **pressure guard** when a more
   permissive decision is recorded with no lookup evidence gathered since the previous one (a repeated
-  reversal is replaced by a firm neutral line, or by the batch's lookups alone; tightening, such as
-  ESCALATE to DENY, is treated as self-correction and passes). The pressure guard
+  reversal, or any operational call sent after the refusal, is replaced by a firm neutral line or by
+  the batch's lookups alone; tightening, such as ESCALATE to DENY, is treated as self-correction and
+  passes). The pressure guard
   runs before the gates so a gate can never coach the model into carrying out a reversed decision.
   Earlier tool calls count as done, or as evidence, only when their result came back without an
   error; a `record_decision` with a value outside the four allowed ones is dropped and the model is
