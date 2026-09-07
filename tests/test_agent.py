@@ -7,6 +7,8 @@ from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
 from a2a.types import DataPart, Message, Part, Role, Task, TaskState, TextPart
 from a2a.utils.parts import get_text_parts
 
+import pibench
+
 
 # A2A validation helpers - adapted from https://github.com/a2aproject/a2a-inspector/blob/main/backend/validators.py
 
@@ -293,6 +295,53 @@ async def test_json_data_part_input(agent):
     require_llm(task)
     assert task.status.state == TaskState.completed, task_text(task)
     assert "pineapple" in task_text(task).lower()
+
+
+@pytest.mark.asyncio
+async def test_pibench_shaped_request(agent):
+    """The Pi-Bench green's exact wire shape (no messageId, taskId in configuration) gets a DataPart reply."""
+    tools = [{"type": "function", "function": {
+        "name": "record_decision",
+        "description": "Record the final decision on the pending request.",
+        "parameters": {"type": "object", "properties": {
+            "decision": {"type": "string", "description": "One of ALLOW, ALLOW-CONDITIONAL, DENY, ESCALATE."},
+            "request_id": {"type": "string"}, "rationale": {"type": "string"}},
+            "required": ["decision", "rationale"]}}}]
+    context = [
+        {"kind": "policy", "content": "Policy 1.1: Refunds are allowed within 30 days of purchase with a receipt. "
+                                      "Policy 1.2: After 30 days, refunds are DENIED.",
+         "metadata": {"scenario_id": "toy", "domain": "retail"}},
+        {"kind": "task", "content": "Handle refund request REQ-TOY-1 (purchased 90 days ago, receipt present). "
+                                    "Record your final decision by calling record_decision.",
+         "metadata": {"scenario_id": "toy", "domain": "retail"}},
+    ]
+    messages = [{"role": "assistant", "content": "Hi! How can I help you today?"},
+                {"role": "user", "content": "I'd like a refund for order REQ-TOY-1, I bought it 90 days ago."}]
+    body = {"jsonrpc": "2.0", "id": "t1", "method": "message/send", "params": {
+        "message": {"role": "user", "parts": [{"kind": "data", "data": {
+            "messages": messages, "benchmark_context": context, "tools": tools}}]},
+        "configuration": {"taskId": f"toy-{uuid4().hex}"}}}
+
+    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+        response = await client.post(agent, json=body)
+    assert response.status_code == 200
+    payload = response.json()
+    assert "error" not in payload, payload
+    result = payload["result"]
+    if not result.get("artifacts"):
+        status_text = "\n".join(p.get("text", "") for p in (result.get("status", {}).get("message") or {}).get("parts", []))
+        if "LLM not configured" in status_text:
+            pytest.skip("agent has no LLM API key")
+        pytest.fail(f"no artifact in reply: {payload}")
+    data = result["artifacts"][0]["parts"][0]
+    assert data["kind"] == "data"
+    reply = data["data"]
+    sentinels = {pibench.FALLBACK_TEXT, pibench.HOLD_TEXT, pibench.BOOTSTRAP_TEXT}
+    assert reply.get("content") not in sentinels, reply
+    names = [c["function"]["name"] for c in reply.get("tool_calls", [])]
+    assert names and names[-1] == "record_decision", reply
+    decision = reply["tool_calls"][-1]["function"]["arguments"]
+    assert isinstance(decision, dict) and decision["decision"] == "DENY", reply
 
 
 @pytest.mark.asyncio

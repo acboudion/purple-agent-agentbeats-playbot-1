@@ -16,6 +16,68 @@ Image: `ghcr.io/acboudion/purple-agent-agentbeats-playbot-1:latest`
 - Answers are delivered as a single text artifact named `response`; a system prompt pushes strict
   output-format compliance because replies are parsed by programs, not people.
 
+## Pi-Bench path
+
+The [Pi-Bench](https://agentbeats.dev/agentbeater/pi-bench) green agent speaks a non-standard A2A
+dialect: one DataPart per request with an OpenAI-format transcript (`messages`), the policy and task
+(`benchmark_context`) and tool schemas (`tools`); no `messageId`; and the per-scenario key hidden in
+`configuration.taskId`. The green executes tool calls itself and sends results back as the next
+request, so the agent does exactly one model call per request. `src/pibench.py` handles it:
+
+- `PiBenchCompatMiddleware` injects the missing `messageId` and lifts `configuration.taskId` into
+  `message.contextId` before the a2a-sdk validates the request (conformant requests are untouched).
+- A payload with a list `messages` (or `bootstrap`) is routed to `pibench.run_turn`, which builds a
+  rules + policy + tools system prompt, sanitises the transcript, calls the model with the tools, and
+  replies with **one DataPart artifact** `{"tool_calls": [...], "content": "..."}`. It never raises and
+  never returns an empty part: model failures or timeouts become a short text reply, because an
+  empty part, an empty `tool_calls` list or a JSON-RPC error would end the scenario.
+- `record_decision` is always emitted last, its `decision` value is canonicalised, and a late-turn
+  reminder is added when no valid decision exists yet. Three deterministic guards re-ask the model
+  once: an **evidence gate** when the first decision of a scenario is recorded while offered lookup
+  tools (`lookup_*`, `query_*`, `get_*`, `check_*`, ...) are still unused (the lookups go out first
+  and the decision follows in a later turn), a **decision gate** when a decision is recorded without
+  the tools it requires: the `escalate*` tool for ESCALATE, the `deny*` tool for DENY, a `hold_*`
+  tool for either, and a `log_*` ticket tool for any decision, whenever the scenario offers them (the
+  held-back batch is never lost or trimmed by the re-ask unless the re-ask changed the decision,
+  merged calls are put in policy-workflow order so a supplied hold precedes the escalation, and the
+  gate fires a second time when the first re-ask added some but not all of the missing tools), and a **pressure guard** when a more
+  permissive decision is recorded with no lookup evidence gathered since the previous one (a repeated
+  reversal, or any operational call sent after the refusal, is replaced by a firm neutral line or by
+  the batch's lookups alone; tightening, such as ESCALATE to DENY, is treated as self-correction and
+  passes). The pressure guard
+  runs before the gates so a gate can never coach the model into carrying out a reversed decision.
+  Earlier tool calls count as done, or as evidence, only when their result came back without an
+  error; a `record_decision` with a value outside the four allowed ones is dropped and the model is
+  asked once for a valid one; prose that accompanies tool calls is kept for the guards to read and
+  dropped on the way out (see `PIBENCH_STRIP_TOOL_CONTENT`). A same-value re-record with no new evidence is stripped instead
+  (the model is asked once for a text answer), which keeps late turns from burning the green's step
+  budget on redundant `record_decision` calls. Identifier parameters of `record_decision` that the model leaves
+  out are copied from the transcript's own tool calls and results. The gate rules come from the
+  public scenario corpus: every scenario that offers a hold, a ticket log or lookups expects them.
+- Bootstrap is not advertised (the SDK card cannot carry the top-level `extensions` key the green
+  reads, and the Quick Submit proxy 404s the probe anyway); a bootstrap request gets a harmless non-ack.
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `PIBENCH_REASONING_EFFORT` | `LLM_REASONING_EFFORT`, else `none` for the gpt-5.4 family, else `medium` | Sent on every Pi-Bench call. gpt-5.4 and gpt-5.4-mini reject any effort other than `none` together with function tools on chat completions (reasoning with tools needs the Responses API), so they run without reasoning here; a rejected parameter is retried without it and remembered. |
+| `PIBENCH_TURN_BUDGET_S` | `95` | Wall-clock cap per request, retry included (the green's deadline is 120 s). |
+| `PIBENCH_LLM_TIMEOUT_S` / `PIBENCH_LLM_MAX_RETRIES` | `80` / `2` | Per-attempt timeout and SDK retries for this path. |
+| `PIBENCH_MAX_OUTPUT_TOKENS` | `24000` | Output cap including reasoning tokens. |
+| `PIBENCH_SEND_SEED` | `0` | Forward the green's `seed` (OpenAI only). A rejected parameter is retried without it. |
+| `PIBENCH_STRIP_TOOL_CONTENT` | `1` | Drop prose that accompanies tool calls (the judges read every assistant text, and text sent with tool calls can announce an outcome before `record_decision` succeeded). |
+| `PIBENCH_NUDGE_AFTER_USER_TURNS` / `PIBENCH_MAX_STEPS` / `PIBENCH_NUDGE_STEP_MARGIN` | `7` / `40` / `4` | When the decision reminder fires. |
+
+Local end-to-end check with the real green agent (costs cents; the user simulator uses
+`gpt-4.1-mini` and the judge `gpt-5.2` on your key):
+
+```bash
+git clone https://github.com/Jyoti-Ranjan-Das845/pi-bench ../pi-bench
+cd ../pi-bench && uv venv --python 3.12 && uv pip install -e .
+# agent running on 9009 in another terminal; <dir> holds a few scenario JSON files
+.venv/Scripts/python examples/a2a_demo/run_a2a.py --external --port 9009 --serve-user \
+  --user-model gpt-4.1-mini --concurrency 1 --max-steps 40 --scenarios-dir <dir> --save-to out.json
+```
+
 ## Project structure
 
 ```
@@ -24,10 +86,12 @@ src/
 ├─ executor.py    # A2A request handling; one Agent per context_id
 ├─ agent.py       # Playbot logic: history, system prompt, LLM call, artifact
 ├─ llm.py         # Provider selection + thin async OpenAI-SDK client (OpenAI / Gemini)
+├─ pibench.py     # Pi-Bench adapter: request-compat middleware, prompt, one-call turn, reply shaping
 └─ messenger.py   # A2A client utility for calling other agents (unused by default)
 tests/
-├─ test_agent.py  # A2A conformance tests + Playbot behaviour tests (need a running agent)
-└─ test_llm.py    # Keyless unit tests for configuration resolution
+├─ test_agent.py   # A2A conformance tests + Playbot behaviour tests (need a running agent)
+├─ test_llm.py     # Keyless unit tests for configuration resolution
+└─ test_pibench.py # Keyless Pi-Bench adapter tests (fake model, in-process ASGI)
 Dockerfile            # Container image (uv, Python 3.13)
 amber-manifest.json5  # Amber manifest used by AgentBeats scenarios
 .env.example          # Template for local secrets
