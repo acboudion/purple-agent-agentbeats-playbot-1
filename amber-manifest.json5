@@ -64,6 +64,7 @@
     a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
   },
 
-  // Expose it to the scenario as "a2a" (canonical dotted form, accepted at 0.1.0).
-  exports: { a2a: "provides.a2a" },
+  // Expose it to the scenario as "a2a". The AgentBeats Quick Submit checker resolves this value as
+  // a key of `provides`, so it must be the bare name ("a2a"), not the dotted form "provides.a2a".
+  exports: { a2a: "a2a" },
 }
